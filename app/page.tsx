@@ -1,6 +1,8 @@
 "use client";
 
 import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
+import { useAccount } from "./amplify-provider";
+import { getWorkspaceClient } from "../lib/workspace-client";
 
 type CostItem = {
   id: string;
@@ -31,6 +33,7 @@ type Product = {
   sku: string;
   description: string;
   materials: RecipeLine[];
+  consumables: RecipeLine[];
   labor: RecipeLine[];
   machines: RecipeLine[];
   shipping: RecipeLine[];
@@ -42,6 +45,7 @@ type Product = {
 
 type AppData = {
   materials: CostItem[];
+  consumables: CostItem[];
   labor: CostItem[];
   machines: CostItem[];
   shipping: CostItem[];
@@ -49,8 +53,8 @@ type AppData = {
   products: Product[];
 };
 
-type LibraryKey = "materials" | "labor" | "machines" | "shipping";
-type View = "overview" | "products" | LibraryKey | "platforms";
+type LibraryKey = "materials" | "consumables" | "labor" | "machines" | "shipping";
+type View = "overview" | "sales" | "products" | LibraryKey | "platforms";
 
 const today = () => new Date().toISOString().slice(0, 10);
 const uid = () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -65,6 +69,11 @@ const starterData: AppData = {
     { id: "mat-ply", name: "Baltic birch plywood", category: "Sheet goods", unit: "sq ft", cost: 3.2, updated: "2026-07-14" },
     { id: "mat-oil", name: "Hardwax oil", category: "Finish", unit: "fl oz", cost: 1.85, updated: "2026-07-08" },
     { id: "mat-feet", name: "Brass furniture feet", category: "Hardware", unit: "each", cost: 3.4, updated: "2026-07-19" },
+  ],
+  consumables: [
+    { id: "con-sandpaper", name: "Sanding disc — 120 grit", category: "Abrasives", unit: "disc", cost: 0.82, updated: "2026-07-20" },
+    { id: "con-glue", name: "Wood glue", category: "Adhesives", unit: "fl oz", cost: 0.34, updated: "2026-07-20" },
+    { id: "con-rag", name: "Finishing cloth", category: "Finishing", unit: "each", cost: 0.46, updated: "2026-07-20" },
   ],
   labor: [
     { id: "lab-build", name: "Craftsperson — build", category: "Production", unit: "hour", cost: 32, updated: "2026-07-01" },
@@ -99,6 +108,10 @@ const starterData: AppData = {
         { id: "line-2", itemId: "mat-oil", quantity: 1.5 },
         { id: "line-3", itemId: "mat-feet", quantity: 4 },
       ],
+      consumables: [
+        { id: "line-con-1", itemId: "con-sandpaper", quantity: 2 },
+        { id: "line-con-2", itemId: "con-glue", quantity: 1.5 },
+      ],
       labor: [
         { id: "line-4", itemId: "lab-build", quantity: 1.75 },
         { id: "line-5", itemId: "lab-finish", quantity: 0.75 },
@@ -127,6 +140,7 @@ const blankProduct = (): Product => ({
   sku: "",
   description: "",
   materials: [],
+  consumables: [],
   labor: [],
   machines: [],
   shipping: [],
@@ -138,8 +152,10 @@ const blankProduct = (): Product => ({
 
 const nav: { id: View; label: string; short: string }[] = [
   { id: "overview", label: "Overview", short: "OV" },
+  { id: "sales", label: "Sales dashboard", short: "SD" },
   { id: "products", label: "Products", short: "PR" },
   { id: "materials", label: "Raw materials", short: "RM" },
+  { id: "consumables", label: "Consumables", short: "CO" },
   { id: "labor", label: "Labor types", short: "LB" },
   { id: "machines", label: "Machine time", short: "MT" },
   { id: "shipping", label: "Shipping supplies", short: "SP" },
@@ -152,10 +168,23 @@ function lineCost(lines: RecipeLine[], items: CostItem[]) {
 
 function getProductCosts(product: Product, data: AppData) {
   const materials = lineCost(product.materials, data.materials);
+  const consumables = lineCost(product.consumables || [], data.consumables || []);
   const labor = lineCost(product.labor, data.labor);
   const machines = lineCost(product.machines, data.machines);
   const shipping = lineCost(product.shipping, data.shipping);
-  return { materials, labor, machines, shipping, total: materials + labor + machines + shipping };
+  return { materials, consumables, labor, machines, shipping, total: materials + consumables + labor + machines + shipping };
+}
+
+function normalizeAppData(value: Partial<AppData>): AppData {
+  return {
+    ...structuredClone(starterData),
+    ...value,
+    consumables: value.consumables ?? structuredClone(starterData.consumables),
+    products: (value.products ?? starterData.products).map((product) => ({
+      ...product,
+      consumables: product.consumables ?? [],
+    })),
+  };
 }
 
 function platformResult(price: number, baseCost: number, platform: Platform) {
@@ -165,6 +194,7 @@ function platformResult(price: number, baseCost: number, platform: Platform) {
 }
 
 export default function Home() {
+  const account = useAccount();
   const [data, setData] = useState<AppData>(starterData);
   const [view, setView] = useState<View>("overview");
   const [selectedId, setSelectedId] = useState("prod-board");
@@ -174,32 +204,72 @@ export default function Home() {
   const [search, setSearch] = useState("");
   const [saved, setSaved] = useState(false);
   const [hydrated, setHydrated] = useState(false);
+  const [workspaceId, setWorkspaceId] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    try {
-      const stored = localStorage.getItem("benchboard-cogs-v1");
-      if (stored) {
-        const parsed = JSON.parse(stored) as AppData;
-        setData(parsed);
-        if (parsed.products[0]) {
-          setSelectedId(parsed.products[0].id);
-          setEditor(parsed.products[0]);
+    let active = true;
+    const loadWorkspace = async () => {
+      try {
+        if (account.cloudEnabled) {
+          const workspaceClient = getWorkspaceClient();
+          const { data: workspaces } = await workspaceClient.models.Workspace.list();
+          const workspace = workspaces[0];
+          if (workspace && active) {
+            const parsed = normalizeAppData(workspace.payload as Partial<AppData>);
+            setWorkspaceId(workspace.id);
+            setData(parsed);
+            if (parsed.products[0]) {
+              setSelectedId(parsed.products[0].id);
+              setEditor(parsed.products[0]);
+            }
+          } else if (active) {
+            const { data: created } = await workspaceClient.models.Workspace.create({
+              name: "My workshop",
+              payload: starterData,
+            });
+            setWorkspaceId(created?.id ?? null);
+          }
+        } else {
+          const stored = localStorage.getItem("benchboard-cogs-v2");
+          if (stored) {
+            const parsed = normalizeAppData(JSON.parse(stored) as Partial<AppData>);
+            setData(parsed);
+            if (parsed.products[0]) {
+              setSelectedId(parsed.products[0].id);
+              setEditor(parsed.products[0]);
+            }
+          }
         }
+      } catch {
+        // Starter data remains available while a cloud environment is being provisioned.
+      } finally {
+        if (active) setHydrated(true);
       }
-    } catch {
-      // Keep the useful starter data if a local backup is malformed.
-    }
-    setHydrated(true);
-  }, []);
+    };
+    void loadWorkspace();
+    return () => {
+      active = false;
+    };
+  }, [account.cloudEnabled]);
 
   useEffect(() => {
     if (!hydrated) return;
-    localStorage.setItem("benchboard-cogs-v1", JSON.stringify(data));
-    setSaved(true);
-    const timer = window.setTimeout(() => setSaved(false), 1400);
+    const timer = window.setTimeout(async () => {
+      if (account.cloudEnabled && workspaceId) {
+        const workspaceClient = getWorkspaceClient();
+        await workspaceClient.models.Workspace.update({
+          id: workspaceId,
+          payload: data,
+        });
+      } else if (!account.cloudEnabled) {
+        localStorage.setItem("benchboard-cogs-v2", JSON.stringify(data));
+      }
+      setSaved(true);
+      window.setTimeout(() => setSaved(false), 1400);
+    }, 500);
     return () => window.clearTimeout(timer);
-  }, [data, hydrated]);
+  }, [data, hydrated, account.cloudEnabled, workspaceId]);
 
   const selected = data.products.find((product) => product.id === selectedId) || data.products[0];
   const costs = useMemo(() => getProductCosts(editor, data), [editor, data]);
@@ -245,7 +315,7 @@ export default function Home() {
     const reader = new FileReader();
     reader.onload = () => {
       try {
-        const parsed = JSON.parse(String(reader.result)) as AppData;
+        const parsed = normalizeAppData(JSON.parse(String(reader.result)) as Partial<AppData>);
         if (!parsed.materials || !parsed.products || !parsed.platforms) throw new Error("Invalid backup");
         setData(parsed);
         if (parsed.products[0]) chooseProduct(parsed.products[0]);
@@ -282,7 +352,7 @@ export default function Home() {
           ))}
         </nav>
         <div className="sidebar-foot">
-          <div className="save-state"><span className={saved ? "pulse" : ""} />{saved ? "Saved just now" : "Saved on this device"}</div>
+          <div className="save-state"><span className={saved ? "pulse" : ""} />{saved ? "Saved just now" : account.cloudEnabled ? "Private cloud workspace" : "Saved on this device"}</div>
           <button onClick={exportData}>Export backup</button>
           <button onClick={() => fileInput.current?.click()}>Import backup</button>
           <input ref={fileInput} type="file" accept=".json" hidden onChange={importData} />
@@ -297,7 +367,8 @@ export default function Home() {
             <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search the workshop…" />
           </label>
           <div className="top-actions">
-            <span className="local-pill">● Local workspace</span>
+            <span className="local-pill">● {account.cloudEnabled ? account.username : "Local preview"}</span>
+            {account.signOut && <button className="secondary compact" onClick={account.signOut}>Sign out</button>}
             <button className="primary compact" onClick={createProduct}>＋ New product</button>
           </div>
         </header>
@@ -311,6 +382,7 @@ export default function Home() {
         {view === "overview" && (
           <Overview data={data} search={search} onProduct={chooseProduct} onNavigate={setView} onCreate={createProduct} />
         )}
+        {view === "sales" && <SalesDashboard data={data} />}
         {view === "products" && (
           <ProductStudio
             data={data}
@@ -332,7 +404,7 @@ export default function Home() {
             }}
           />
         )}
-        {(view === "materials" || view === "labor" || view === "machines" || view === "shipping") && (
+        {(view === "materials" || view === "consumables" || view === "labor" || view === "machines" || view === "shipping") && (
           <Library
             kind={view}
             items={data[view]}
@@ -349,6 +421,7 @@ export default function Home() {
               setEditingItem(null);
             }}
             onDelete={(id) => setData((current) => ({ ...current, [view]: current[view].filter((item) => item.id !== id) }))}
+            onBulkImport={(items) => setData((current) => ({ ...current, [view]: [...current[view], ...items] }))}
           />
         )}
         {view === "platforms" && (
@@ -370,7 +443,7 @@ export default function Home() {
           />
         )}
         <footer className="app-footer">
-          <span>Benchboard stores data in this browser.</span>
+          <span>{account.cloudEnabled ? "Your workshop data is private to your account." : "Local preview mode — connect Amplify for account storage."}</span>
           <button onClick={resetDemo}>Restore starter data</button>
         </footer>
       </section>
@@ -386,7 +459,7 @@ function Overview({ data, search, onProduct, onNavigate, onCreate }: {
   onCreate: () => void;
 }) {
   const products = data.products.filter((product) => product.name.toLowerCase().includes(search.toLowerCase()));
-  const inventoryCount = data.materials.length + data.labor.length + data.machines.length + data.shipping.length;
+  const inventoryCount = data.materials.length + data.consumables.length + data.labor.length + data.machines.length + data.shipping.length;
   const featured = products[0] || data.products[0];
   const featuredCost = featured ? getProductCosts(featured, data) : null;
   const lowestMargin = data.products.reduce((lowest, product) => {
@@ -442,6 +515,7 @@ function Overview({ data, search, onProduct, onNavigate, onCreate }: {
             <>
               <div className="cost-total"><span>Total product cost</span><strong>{formatMoney(featuredCost.total)}</strong></div>
               <CostBar label="Raw materials" value={featuredCost.materials} total={featuredCost.total} color="var(--walnut)" />
+              <CostBar label="Consumables" value={featuredCost.consumables} total={featuredCost.total} color="var(--clay)" />
               <CostBar label="Labor" value={featuredCost.labor} total={featuredCost.total} color="var(--sage)" />
               <CostBar label="Machine time" value={featuredCost.machines} total={featuredCost.total} color="var(--ochre)" />
               <CostBar label="Shipping materials" value={featuredCost.shipping} total={featuredCost.total} color="var(--clay)" />
@@ -465,6 +539,63 @@ function Overview({ data, search, onProduct, onNavigate, onCreate }: {
             </button>
           ))}
         </div>
+      </section>
+    </div>
+  );
+}
+
+function SalesDashboard({ data }: { data: AppData }) {
+  const [productId, setProductId] = useState(data.products[0]?.id ?? "");
+  const product = data.products.find((item) => item.id === productId) ?? data.products[0];
+  const availablePlatforms = product
+    ? data.platforms.filter((platform) => product.platformIds.includes(platform.id))
+    : data.platforms;
+  const [platformId, setPlatformId] = useState(availablePlatforms[0]?.id ?? data.platforms[0]?.id ?? "");
+  const [saleAmount, setSaleAmount] = useState(product?.targetPrice ?? 0);
+  const [quantity, setQuantity] = useState(1);
+  const platform = data.platforms.find((item) => item.id === platformId) ?? data.platforms[0];
+  const unitCost = product ? getProductCosts(product, data).total : 0;
+  const revenue = Math.max(0, saleAmount) * Math.max(1, quantity);
+  const totalCost = unitCost * Math.max(1, quantity);
+  const fees = platform ? revenue * ((platform.percent + platform.payment) / 100) + platform.fixed * Math.max(1, quantity) : 0;
+  const profit = revenue - totalCost - fees;
+  const margin = revenue ? (profit / revenue) * 100 : 0;
+  const breakEven = platform
+    ? (unitCost + platform.fixed) / Math.max(0.01, 1 - (platform.percent + platform.payment) / 100)
+    : unitCost;
+
+  useEffect(() => {
+    if (!product) return;
+    setSaleAmount(product.targetPrice);
+    const firstPlatform = data.platforms.find((item) => product.platformIds.includes(item.id));
+    if (firstPlatform) setPlatformId(firstPlatform.id);
+  }, [productId, product, data.platforms]);
+
+  if (!product) return <div className="page"><div className="empty">Create a product to model a sale.</div></div>;
+
+  return (
+    <div className="page sales-page">
+      <div className="page-heading">
+        <div><p className="eyebrow">Sales planning</p><h1>Model the profit on every sale</h1><p>Set the selling amount, quantity, and channel to see fees, COGS, and take-home profit immediately.</p></div>
+      </div>
+      <section className="panel sale-controls">
+        <label>Product<select value={product.id} onChange={(event) => setProductId(event.target.value)}>{data.products.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+        <label>Sales channel<select value={platform?.id ?? ""} onChange={(event) => setPlatformId(event.target.value)}>{availablePlatforms.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+        <label>Sale amount per item<div className="money-field"><span>$</span><input type="number" min="0" step=".5" value={saleAmount || ""} onChange={(event) => setSaleAmount(Number(event.target.value))} /></div></label>
+        <label>Quantity<input type="number" min="1" step="1" value={quantity} onChange={(event) => setQuantity(Math.max(1, Number(event.target.value)))} /></label>
+      </section>
+      <div className="sale-metrics">
+        <article><small>Revenue</small><strong>{formatMoney(revenue)}</strong><em>{quantity} × {formatMoney(saleAmount)}</em></article>
+        <article><small>Total COGS</small><strong>{formatMoney(totalCost)}</strong><em>{formatMoney(unitCost)} per item</em></article>
+        <article><small>Platform fees</small><strong>{formatMoney(fees)}</strong><em>{platform?.name ?? "No platform"}</em></article>
+        <article className={profit < 0 ? "negative" : "positive"}><small>Projected profit</small><strong>{formatMoney(profit)}</strong><em>{margin.toFixed(1)}% margin</em></article>
+      </div>
+      <section className="panel sale-waterfall">
+        <div><span>Gross sales</span><strong>{formatMoney(revenue)}</strong></div>
+        <div><span>Less product costs</span><strong>− {formatMoney(totalCost)}</strong></div>
+        <div><span>Less channel fees</span><strong>− {formatMoney(fees)}</strong></div>
+        <div className="sale-profit"><span>Take-home profit</span><strong>{formatMoney(profit)}</strong></div>
+        <p>Break-even price per item on {platform?.name ?? "this channel"}: <b>{formatMoney(breakEven)}</b></p>
       </section>
     </div>
   );
@@ -497,6 +628,7 @@ function ProductStudio({ data, editor, setEditor, costs, suggestedPrice, selecte
   const markups = [35, 50, 60, 75, 100];
   const groups: { key: LibraryKey; title: string; note: string }[] = [
     { key: "materials", title: "Raw materials", note: "Boards, hardware & finish" },
+    { key: "consumables", title: "Consumables", note: "Abrasives, adhesives & shop supplies" },
     { key: "labor", title: "Labor", note: "People and production time" },
     { key: "machines", title: "Machine time", note: "Equipment operating time" },
     { key: "shipping", title: "Shipping materials", note: "Packaging used per order" },
@@ -574,6 +706,7 @@ function ProductStudio({ data, editor, setEditor, costs, suggestedPrice, selecte
             <h2>Know your number</h2>
             <div className="cost-breakdown">
               <span>Materials <b>{formatMoney(costs.materials)}</b></span>
+              <span>Consumables <b>{formatMoney(costs.consumables)}</b></span>
               <span>Labor <b>{formatMoney(costs.labor)}</b></span>
               <span>Machine time <b>{formatMoney(costs.machines)}</b></span>
               <span>Shipping supplies <b>{formatMoney(costs.shipping)}</b></span>
@@ -649,12 +782,34 @@ function RecipeGroup({ title, note, items, lines, onAdd, onUpdate, onRemove }: {
 
 const libraryMeta: Record<LibraryKey, { title: string; singular: string; description: string; defaultCategory: string; defaultUnit: string }> = {
   materials: { title: "Raw materials", singular: "material", description: "Lumber, sheet goods, finishes, and hardware used in your builds.", defaultCategory: "Hardwood", defaultUnit: "board ft" },
+  consumables: { title: "Consumables", singular: "consumable", description: "Abrasives, adhesives, finishing supplies, and other shop items used up during production.", defaultCategory: "Abrasives", defaultUnit: "each" },
   labor: { title: "Labor types", singular: "labor type", description: "Set a true hourly cost for every kind of work in your shop.", defaultCategory: "Production", defaultUnit: "hour" },
   machines: { title: "Machine time", singular: "machine", description: "Capture depreciation, power, maintenance, and consumables as an hourly rate.", defaultCategory: "Cutting", defaultUnit: "machine hr" },
   shipping: { title: "Shipping supplies", singular: "shipping item", description: "Boxes, cushioning, labels, tape, and inserts used to fulfill an order.", defaultCategory: "Packaging", defaultUnit: "each" },
 };
 
-function Library({ kind, items, search, editing, onEdit, onSave, onDelete }: {
+async function parseMaterialWorkbook(file: File): Promise<CostItem[]> {
+  const XLSX = await import("xlsx");
+  const workbook = XLSX.read(await file.arrayBuffer(), { type: "array" });
+  const worksheet = workbook.Sheets[workbook.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(worksheet, { defval: "" });
+  const getValue = (row: Record<string, unknown>, key: string) => {
+    const entry = Object.entries(row).find(([heading]) => heading.trim().toLowerCase() === key);
+    return entry?.[1];
+  };
+  const imported = rows.map((row) => ({
+    id: uid(),
+    name: String(getValue(row, "name") ?? "").trim(),
+    category: String(getValue(row, "category") ?? "").trim(),
+    unit: String(getValue(row, "unit") ?? "").trim(),
+    cost: Number(getValue(row, "cost") ?? 0),
+    updated: today(),
+  })).filter((item) => item.name && item.category && item.unit && Number.isFinite(item.cost) && item.cost >= 0);
+  if (!imported.length) throw new Error("No valid rows");
+  return imported;
+}
+
+function Library({ kind, items, search, editing, onEdit, onSave, onDelete, onBulkImport }: {
   kind: LibraryKey;
   items: CostItem[];
   search: string;
@@ -662,10 +817,13 @@ function Library({ kind, items, search, editing, onEdit, onSave, onDelete }: {
   onEdit: (item: CostItem | null) => void;
   onSave: (item: CostItem) => void;
   onDelete: (id: string) => void;
+  onBulkImport: (items: CostItem[]) => void;
 }) {
   const meta = libraryMeta[kind];
   const filtered = items.filter((item) => `${item.name} ${item.category}`.toLowerCase().includes(search.toLowerCase()));
   const [draft, setDraft] = useState<CostItem | null>(null);
+  const bulkInput = useRef<HTMLInputElement>(null);
+  const supportsBulkImport = kind === "materials" || kind === "consumables";
 
   useEffect(() => setDraft(editing), [editing]);
   const beginNew = () => {
@@ -676,7 +834,38 @@ function Library({ kind, items, search, editing, onEdit, onSave, onDelete }: {
 
   return (
     <div className="page library-page">
-      <div className="page-heading"><div><p className="eyebrow">Master cost library</p><h1>{meta.title}</h1><p>{meta.description}</p></div><button className="primary" onClick={beginNew}>＋ Add {meta.singular}</button></div>
+      <div className="page-heading">
+        <div><p className="eyebrow">Master cost library</p><h1>{meta.title}</h1><p>{meta.description}</p></div>
+        <div className="heading-actions">
+          {supportsBulkImport && <button className="secondary" onClick={() => bulkInput.current?.click()}>Upload CSV / Excel</button>}
+          <button className="primary" onClick={beginNew}>＋ Add {meta.singular}</button>
+        </div>
+      </div>
+      {supportsBulkImport && (
+        <div className="import-strip">
+          <span>Bulk add materials using the provided columns: Name, Category, Unit, Cost.</span>
+          <a href="/templates/materials-import-template.csv" download>Download CSV example</a>
+          <a href="/templates/materials-import-template.xlsx" download>Download Excel example</a>
+          <input
+            ref={bulkInput}
+            type="file"
+            accept=".csv,.xlsx,.xls"
+            hidden
+            onChange={async (event) => {
+              const file = event.target.files?.[0];
+              if (!file) return;
+              try {
+                const imported = await parseMaterialWorkbook(file);
+                onBulkImport(imported);
+                window.alert(`Imported ${imported.length} ${kind === "consumables" ? "consumables" : "materials"}.`);
+              } catch {
+                window.alert("No valid rows were found. Use the example template and keep Name, Category, Unit, and Cost headers.");
+              }
+              event.target.value = "";
+            }}
+          />
+        </div>
+      )}
       <section className="panel table-panel">
         <div className="table-tools"><span>{filtered.length} items</span><small>Update prices here and every product recipe recalculates automatically.</small></div>
         <div className="data-table">
