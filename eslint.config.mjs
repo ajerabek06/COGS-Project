@@ -1,15 +1,25 @@
-import { FlatCompat } from "@eslint/eslintrc";
-import { dirname } from "node:path";
-import { fileURLToPath } from "node:url";
-
-const compat = new FlatCompat({
-  baseDirectory: dirname(fileURLToPath(import.meta.url)),
-});
-
 const eslintConfig = [
-  ...compat.extends("next/core-web-vitals", "next/typescript"),
   {
-    ignores: [".next/**", "out/**", "build/**", "next-env.d.ts"],
+    files: ["**/*.{js,mjs,cjs,ts,tsx}"],
+    plugins: {
+      "@next/next": (await import("@next/eslint-plugin-next")).default,
+      "@typescript-eslint": (await import("@typescript-eslint/eslint-plugin")).default,
+    },
+    languageOptions: {
+      parser: (await import("@typescript-eslint/parser")).default,
+      parserOptions: {
+        ecmaVersion: "latest",
+        sourceType: "module",
+        ecmaFeatures: { jsx: true },
+      },
+    },
+    rules: {
+      ...(await import("@next/eslint-plugin-next")).default.configs["core-web-vitals"].rules,
+      ...(await import("@typescript-eslint/eslint-plugin")).default.configs.recommended.rules,
+    },
+  },
+  {
+    ignores: [".next/**", "out/**", "build/**", "next-env.d.ts", ".tmp-material-template/**"],
   },
 ];
 
